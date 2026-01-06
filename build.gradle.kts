@@ -30,24 +30,14 @@ paperweight {
         patchRepo("paperApi") {
             upstreamPath = "paper-api"
             patchesDir = file("baguette-api/paper-patches")
-            // Thanks to weaver, you can also use ATs for all sources, not just the minecraft one.
-            // By default, when weaver is looking for an AT file for a patch source set, it looks under the `build-data` dir for an AT file under the name of the patch set.
-            // For this patchRepo, it would look for paperApi.at because 'paperApi` is the name of the source set, as declared in the `patchRepo("paperApi")` field.
-            // If you want to override either the location of build-data dir or the at file itself you can do so by modifying the `buildDataDir` and/or `additionalAts` fields.
-            // An important behavior change compared to paperweight in regards to the minecraft AT file is the added possibility to specify ats for libraries instead of having to patch them manually.
             outputDir = file("paper-api")
-        }
-        patchRepo("foliaApi") {
-            upstreamPath = "folia-api"
-            patchesDir = file("baguette-api/folia-patches")
-            outputDir = file("folia-api")
         }
         patchDir("canvasApi") {
             upstreamPath = "canvas-api"
-            excludes = listOf("build.gradle.kts", "build.gradle.kts.patch", "paper-patches", "folia-patches")
+            excludes = listOf("build.gradle.kts", "build.gradle.kts.patch", "paper-patches")
             patchesDir = file("baguette-api/canvas-patches")
             outputDir = file("canvas-api")
-	}
+        }
     }
 }
 

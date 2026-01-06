@@ -2,7 +2,7 @@
 
 ## 🚀 Quick Start
 
-Simply run `menu.bat` to access all development tasks through an easy-to-use interactive menu.
+On Linux, run `./menu.sh` (from this `scripts/` directory) to access all development tasks through an interactive menu.
 
 ## Available Features
 
@@ -25,7 +25,7 @@ Simply run `menu.bat` to access all development tasks through an easy-to-use int
 
 ## Common Workflow
 
-1. **Initial Setup**: Run `menu.bat` and select "Initial Setup"
+1. **Initial Setup**: Run `./menu.sh` and select "Initial Setup"
 2. **Making Changes**:
    - Modify source files in the appropriate directories:
      - `baguette-api/` for API changes

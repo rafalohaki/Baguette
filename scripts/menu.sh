@@ -6,6 +6,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 GRADLEW="$PROJECT_ROOT/gradlew"
 
+# Color definitions
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
 TASKS_CACHE=""
 
 load_tasks_cache() {
@@ -24,12 +30,38 @@ load_tasks_cache() {
 
 task_exists() {
   local task="$1"
+  task="${task#:}"
   load_tasks_cache || return 1
   printf '%s\n' "$TASKS_CACHE" | grep -Eq "^${task}[[:space:]]"
 }
 
+run_task_allow_empty() {
+  local task="$1"
+  task="${task#:}"
+  shift
+  
+  if ! task_exists "$task"; then
+    printf "\n[ERROR] Gradle task nie istnieje: %s\n" "$task"
+    return 1
+  fi
+  
+  local output
+  output=$((cd "$PROJECT_ROOT" && "$GRADLEW" "$task" "$@") 2>&1)
+  local rc=$?
+  
+  printf "%s\n" "$output"
+  
+  # "nothing to commit" is not an error for fixup tasks
+  if printf "%s" "$output" | grep -q "nothing to commit, working tree clean"; then
+    return 0
+  fi
+  
+  return $rc
+}
+
 run_task_if_exists() {
   local task="$1"
+  task="${task#:}"
   shift
   if ! task_exists "$task"; then
     printf "\n[ERROR] Gradle task nie istnieje: %s\n" "$task"
@@ -37,6 +69,24 @@ run_task_if_exists() {
     return 1
   fi
   (cd "$PROJECT_ROOT" && "$GRADLEW" "$task" "$@")
+}
+
+run_first_existing_task() {
+  local task
+  for task in "$@"; do
+    task="${task#:}"
+    if task_exists "$task"; then
+      (cd "$PROJECT_ROOT" && "$GRADLEW" "$task")
+      return $?
+    fi
+  done
+  return 1
+}
+
+print_matching_tasks() {
+  local pattern="$1"
+  load_tasks_cache || return 1
+  printf '%s\n' "$TASKS_CACHE" | grep -Ei "^[:[:alnum:]_.-]+${pattern}[:[:alnum:]_.-]*[[:space:]]" || true
 }
 
 die() {
@@ -106,41 +156,43 @@ apply_patches() {
 rebuild_patches() {
   clear
   printf "\n[B] Rebuilding All Patches\n=========================\n\n"
-
-  # Prefer tasks that are actually present in this repo (per './gradlew tasks').
-  # Canvas/API patches:
-  # - rebuildCanvasSingleFilePatches (or rebuildCanvasPatches)
-  # - rebuildPaperApiPatches
-  # Server patches:
-  # - rebuildServerPatches (optionally rebuildFoliaServerPatches if present)
+  
   local ok=0
-
+  
+  # 1. Canvas single-file patches (top priority)
   if task_exists rebuildCanvasSingleFilePatches; then
+    printf "Rebuilding Canvas single-file patches...\n"
     run_task_if_exists rebuildCanvasSingleFilePatches || ok=1
-  elif task_exists rebuildCanvasPatches; then
-    run_task_if_exists rebuildCanvasPatches || ok=1
   fi
-
-  run_task_if_exists rebuildPaperApiPatches || ok=1
-
+  
+  # 2. Canvas API patches
+  if task_exists rebuildCanvasApiPatches; then
+    printf "Rebuilding Canvas API patches...\n"
+    run_task_if_exists rebuildCanvasApiPatches || ok=1
+  fi
+  
+  # 3. Paper API patches
+  if task_exists rebuildPaperApiPatches; then
+    printf "Rebuilding Paper API patches...\n"
+    run_task_if_exists rebuildPaperApiPatches || ok=1
+  fi
+  
+  # 4. Server patches (all: canvas + folia + paper server)
   if task_exists rebuildServerPatches; then
+    printf "Rebuilding all Server patches...\n"
     run_task_if_exists rebuildServerPatches || ok=1
-  elif task_exists rebuildAllServerPatches; then
-    run_task_if_exists rebuildAllServerPatches || ok=1
-  else
-    ok=1
-    printf "\n[ERROR] Nie znaleziono taska 'rebuildServerPatches'.\n"
   fi
-
-  # Optional: some setups expose per-upstream server rebuilds.
-  if task_exists rebuildFoliaServerPatches; then
-    run_task_if_exists rebuildFoliaServerPatches || ok=1
+  
+  # 5. Minecraft patches (base + feature + file)
+  if task_exists rebuildMinecraftPatches; then
+    printf "Rebuilding Minecraft patches...\n"
+    run_task_if_exists rebuildMinecraftPatches || ok=1
   fi
 
   if [[ "$ok" -eq 0 ]]; then
-    printf "\n[SUCCESS] Rebuild tasks completed.\n"
+    printf "\n${GREEN}[SUCCESS]${NC} All patches rebuilt successfully!\n"
   else
-    printf "\n[ERROR] One or more rebuild tasks failed or were missing.\n"
+    printf "\n${RED}[ERROR]${NC} Some rebuild tasks failed.\n"
   fi
   pause
 }
@@ -260,15 +312,15 @@ fixup_patches() {
       run_task_if_exists fixupMinecraftResourcePatches
       rc=$?
     elif [[ "$fixchoice" == "$opt_all" ]]; then
-      printf "\nFixing all available fixup tasks...\n"
+      printf "\nFixing all available patches...\n"
       rc=0
-      [[ "$has_paper_api" -eq 1 ]] && run_task_if_exists fixupPaperApiFilePatches || rc=1
-      [[ "$has_canvas_api" -eq 1 ]] && run_task_if_exists fixupCanvasApiFilePatches || rc=1
-      [[ "$has_paper_server" -eq 1 ]] && run_task_if_exists fixupPaperServerFilePatches || rc=1
-      [[ "$has_folia_server" -eq 1 ]] && run_task_if_exists fixupFoliaServerFilePatches || rc=1
-      [[ "$has_canvas_server" -eq 1 ]] && run_task_if_exists fixupCanvasServerFilePatches || rc=1
-      [[ "$has_mc_source" -eq 1 ]] && run_task_if_exists fixupMinecraftSourcePatches || rc=1
-      [[ "$has_mc_resource" -eq 1 ]] && run_task_if_exists fixupMinecraftResourcePatches || rc=1
+      [[ "$has_paper_api" -eq 1 ]] && { run_task_allow_empty fixupPaperApiFilePatches || rc=1; }
+      [[ "$has_canvas_api" -eq 1 ]] && { run_task_allow_empty fixupCanvasApiFilePatches || rc=1; }
+      [[ "$has_paper_server" -eq 1 ]] && { run_task_allow_empty fixupPaperServerFilePatches || rc=1; }
+      [[ "$has_folia_server" -eq 1 ]] && { run_task_allow_empty fixupFoliaServerFilePatches || rc=1; }
+      [[ "$has_canvas_server" -eq 1 ]] && { run_task_allow_empty fixupCanvasServerFilePatches || rc=1; }
+      [[ "$has_mc_source" -eq 1 ]] && { run_task_allow_empty fixupMinecraftSourcePatches || rc=1; }
+      [[ "$has_mc_resource" -eq 1 ]] && { run_task_allow_empty fixupMinecraftResourcePatches || rc=1; }
     else
       printf "\nNieprawidlowa opcja!\n"
       pause
@@ -291,8 +343,9 @@ build_project() {
   if run_task_if_exists build; then
     printf "\n[SUCCESS] Build successful!\n"
     printf "JAR files are in:\n"
-    printf "- baguette-server/build/libs/\n"
-    printf "- baguette-api/build/libs/\n"
+    printf "%s\n" "- baguette-server/build/libs/"
+    printf "%s\n" "- baguette-api/build/libs/"
+    printf "%s\n" "- canvas-api/build/libs/"
   else
     printf "\n[ERROR] Build failed!\n"
   fi
@@ -302,11 +355,20 @@ build_project() {
 create_paperclip() {
   clear
   printf "\n[J] Creating Paperclip Jar\n========================\n\n"
-  if run_task_if_exists createMojmapPaperclipJar; then
+  if run_first_existing_task \
+    "baguette-server:createMojmapPaperclipJar" \
+    "baguette-server:createMojmapPublisherJar" \
+    "baguette-server:createPublisherJar" \
+    "createMojmapPaperclipJar" \
+    "createMojmapPublisherJar" \
+    "createPublisherJar"; then
     printf "\n[SUCCESS] Paperclip jar created!\n"
     printf "Location: baguette-server/build/libs/\n"
   else
     printf "\n[ERROR] Failed to create Paperclip jar!\n"
+    printf "\nAvailable matching tasks (try these manually):\n"
+    print_matching_tasks "paperclip"
+    print_matching_tasks "PublisherJar"
   fi
   pause
 }
@@ -314,23 +376,34 @@ create_paperclip() {
 run_server() {
   clear
   printf "\n[S] Starting Development Server\n==============================\n\n"
-  printf "Press Ctrl+C to stop the server\n"
-  printf "\nJeśli masz crash przez RAM: uruchom z mniejszą pamięcią przez -Ppaper.runMemoryGb=...\n"
-  printf "Domyślnie ten projekt ma ustawione sporo (w Gradle).\n\n"
-  read -r -p "Ile GB RAM dać serwerowi? (np. 4) [Enter = 4]: " mem_gb
+  printf "Available run options:\n"
+  printf "1. runDevServer   - Fast dev mode (no JAR assembly)\n"
+  printf "2. runServer      - From Mojang mapped JAR\n"
+  printf "3. runPaperclip   - From Paperclip JAR\n"
+  printf "4. runBundler     - From Bundler JAR\n\n"
+  
+  read -r -p "Choose mode (1-4) [default: 1]: " mode_choice
+  mode_choice="${mode_choice:-1}"
+  
+  read -r -p "RAM in GB (default: 4): " mem_gb
   mem_gb="${mem_gb:-4}"
 
-  if task_exists runDevServer; then
-    (cd "$PROJECT_ROOT" && "$GRADLEW" runDevServer "-Ppaper.runMemoryGb=${mem_gb}")
-  elif task_exists runServer; then
-    (cd "$PROJECT_ROOT" && "$GRADLEW" runServer "-Ppaper.runMemoryGb=${mem_gb}")
+  local task=""
+  case "$mode_choice" in
+    1) task="runDevServer" ;;
+    2) task="runServer" ;;
+    3) task="runPaperclip" ;;
+    4) task="runBundler" ;;
+    *) printf "\nInvalid option, using runDevServer\n"; task="runDevServer" ;;
+  esac
+
+  if task_exists "$task"; then
+    printf "\nStarting server with %sGB RAM...\n" "$mem_gb"
+    printf "Press Ctrl+C to stop the server\n\n"
+    (cd "$PROJECT_ROOT" && "$GRADLEW" "$task" "-Ppaper.runMemoryGb=${mem_gb}")
   else
-    printf "\n[ERROR] Nie znaleziono taska runDevServer ani runServer.\n"
-    printf "Podpowiedź: uruchom './gradlew tasks --all' aby zobaczyć listę.\n"
-    pause
-    return
+    printf "\n[ERROR] Task '$task' not found!\n"
   fi
-  printf "\nServer stopped.\n"
   pause
 }
 
@@ -347,26 +420,51 @@ clean_build() {
 
 about() {
   clear
-  printf "\n[I] About Patch System\n=====================\n\n"
+  printf "\n[I] About Baguette Patch System\n==============================\n\n"
+  printf "PATCH HIERARCHY:\n"
+  printf "%s\n" "----------------"
+  printf "Minecraft <- Paper <- Folia <- Canvas <- Baguette\n\n"
+  
   printf "HOW PATCHES WORK:\n"
-  printf "----------------\n"
-  printf "1. You EDIT source files in baguette-api/ or baguette-server/\n"
-  printf "2. Run FIXUP PATCHES - this prepares your changes\n"
-  printf "3. Run REBUILD PATCHES - this saves changes to .patch files\n\n"
-  printf "FIXUP vs REBUILD:\n"
-  printf "- FIXUP: Prepares your code changes internally\n"
-  printf "- REBUILD: Creates the actual .patch files from changes\n\n"
-  printf "ALWAYS use Fixup BEFORE Rebuild after editing code!\n\n"
-  printf "Source directories:\n"
-  printf "- baguette-api/     - Your API changes\n"
-  printf "- baguette-server/  - Your server changes\n"
-  printf "- paper-api/        - Paper API source (read-only)\n"
-  printf "- folia-api/        - Folia API source (read-only)\n"
-  printf "- canvas-api/       - Canvas API source (read-only)\n\n"
-  printf "Patches are stored in:\n"
-  printf "- baguette-api/paper-patches/\n"
-  printf "- baguette-api/folia-patches/\n"
-  printf "- baguette-api/canvas-patches/\n\n"
+  printf "%s\n" "----------------"
+  printf "1. EDIT source files in baguette-server/ or baguette-api/\n"
+  printf "2. Run FIXUP PATCHES (F) - prepares your changes\n"
+  printf "3. Run REBUILD PATCHES (B) - saves to .patch files\n\n"
+  
+  printf "PATCH TYPES:\n"
+  printf "%s\n" "------------"
+  printf "API Patches:\n"
+  printf "%s\n" "- Canvas API patches (canvasApi)"
+  printf "%s\n" "- Paper API patches (paperApi)\n\n"
+  
+  printf "Server Patches:\n"
+  printf "%s\n" "- Canvas Server patches (canvasServer)"
+  printf "%s\n" "- Folia Server patches (foliaServer)"
+  printf "%s\n" "- Paper Server patches (paperServer)\n\n"
+  
+  printf "Minecraft Patches:\n"
+  printf "%s\n" "- Base patches (core changes)"
+  printf "%s\n" "- Feature patches (features)"
+  printf "%s\n" "- File patches (sources & resources)\n\n"
+  
+  printf "DIRECTORIES:\n"
+  printf "%s\n" "------------"
+  printf "Edit code:\n"
+  printf "%s\n" "- baguette-server/    Your server changes"
+  printf "%s\n" "- baguette-api/       Your API changes\n\n"
+  
+  printf "Patches stored:\n"
+  printf "%s\n" "- baguette-server/minecraft-patches/"
+  printf "%s\n" "- baguette-server/paper-patches/"
+  printf "%s\n" "- baguette-server/folia-patches/"
+  printf "%s\n" "- baguette-server/canvas-patches/"
+  printf "%s\n" "- baguette-api/canvas-patches/"
+  printf "%s\n" "- baguette-api/paper-patches/\n\n"
+  
+  printf "BUILD OUTPUT:\n"
+  printf "%s\n" "-------------"
+  printf "%s\n" "- baguette-server/build/libs/*.jar"
+  printf "%s\n" "- baguette-api/build/libs/*.jar\n\n"
   pause
 }
 

@@ -14,6 +14,89 @@ NC='\033[0m' # No Color
 
 TASKS_CACHE=""
 
+# Baguette - Quick CLI commands
+show_help() {
+  printf "Baguette Development Helper\n"
+  printf "Usage: ./menu.sh [OPTION]\n\n"
+  printf "Options:\n"
+  printf "  -i, --init      Initial setup (apply patches + build)\n"
+  printf "  -p, --patch     Apply all patches\n"
+  printf "  -b, --build     Build project\n"
+  printf "  -r, --rebuild   Rebuild all patches\n"
+  printf "  -f, --fixup     Fixup all patches\n"
+  printf "  -j, --jar       Create paperclip jar\n"
+  printf "  -s, --server    Run dev server\n"
+  printf "  -c, --clean     Clean build\n"
+  printf "  -h, --help      Show this help\n"
+  printf "  (no option)     Interactive menu\n"
+  exit 0
+}
+
+# Handle CLI arguments
+if [[ $# -gt 0 ]]; then
+  case "$1" in
+    -i|--init)
+      cd "$PROJECT_ROOT"
+      printf "${GREEN}[Baguette]${NC} Applying patches...\n"
+      "$GRADLEW" applyAllPatches || exit 1
+      printf "${GREEN}[Baguette]${NC} Building...\n"
+      "$GRADLEW" build || exit 1
+      printf "${GREEN}[Baguette]${NC} Setup complete!\n"
+      exit 0
+      ;;
+    -p|--patch)
+      cd "$PROJECT_ROOT"
+      printf "${GREEN}[Baguette]${NC} Applying patches...\n"
+      "$GRADLEW" applyAllPatches
+      exit $?
+      ;;
+    -b|--build)
+      cd "$PROJECT_ROOT"
+      printf "${GREEN}[Baguette]${NC} Building...\n"
+      "$GRADLEW" build
+      exit $?
+      ;;
+    -r|--rebuild)
+      cd "$PROJECT_ROOT"
+      printf "${GREEN}[Baguette]${NC} Rebuilding patches...\n"
+      "$GRADLEW" rebuildMinecraftPatches
+      exit $?
+      ;;
+    -f|--fixup)
+      cd "$PROJECT_ROOT"
+      printf "${GREEN}[Baguette]${NC} Fixing up patches...\n"
+      "$GRADLEW" fixupMinecraftSourcePatches
+      exit $?
+      ;;
+    -j|--jar)
+      cd "$PROJECT_ROOT"
+      printf "${GREEN}[Baguette]${NC} Creating paperclip jar...\n"
+      "$GRADLEW" createMojmapPaperclipJar 2>/dev/null || "$GRADLEW" createReobfPaperclipJar
+      exit $?
+      ;;
+    -s|--server)
+      cd "$PROJECT_ROOT"
+      printf "${GREEN}[Baguette]${NC} Starting dev server...\n"
+      "$GRADLEW" runDevServer
+      exit $?
+      ;;
+    -c|--clean)
+      cd "$PROJECT_ROOT"
+      printf "${GREEN}[Baguette]${NC} Cleaning...\n"
+      "$GRADLEW" clean
+      exit $?
+      ;;
+    -h|--help)
+      show_help
+      ;;
+    *)
+      printf "${RED}Unknown option: $1${NC}\n"
+      show_help
+      ;;
+  esac
+fi
+# Baguette end - Quick CLI commands
+
 load_tasks_cache() {
   if [[ -n "$TASKS_CACHE" ]]; then
     return 0

@@ -1,0 +1,300 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: rafalohaki <rafalohaki@gmail.com>
+Date: Wed, 7 Jan 2026 00:59:30 +0000
+Subject: [PATCH] baguette optimizations from notes.md
+
+- EntityLookup: UUID regeneration for CMI/Fireballs fix
+- Entity: cached collision lists + skip zero movement
+- Level: zero-allocation getEntitiesOfClassInto API
+- Mob: cached item pickup list
+- ServerLevel: exploit prevention (minecarts/boats per chunk)
+- FileUtil: ObjectArrayList optimization
+- ItemEntity: configurable item merging
+- PathFinder: cached lists for pathfinding
+- Connection: configurable packet limiter
+- ServerExplosion: Object2ObjectOpenHashMap
+- FriendlyByteBuf: no-chat-reports feature
+
+diff --git a/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/EntityLookup.java b/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/EntityLookup.java
+index 20941198b3a1227381c0a9039898a6506344a588..90d67e8e84e5c4929087578c78e2e11ffea668d7 100644
+--- a/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/EntityLookup.java
++++ b/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/EntityLookup.java
+@@ -430,10 +430,18 @@ public abstract class EntityLookup implements LevelEntityGetter<Entity> {
+ 
+         currentlyMapped = this.entityByUUID.putIfAbsent(entity.getUUID(), entity);
+         if (currentlyMapped != null) {
+-            // need to remove mapping for id
+-            this.entityById.remove((long)entity.getId(), entity);
+-            LOGGER.warn("Entity uuid already exists: " + entity.getUUID() + ", mapped to " + currentlyMapped + ", can't add " + entity);
+-            return false;
++            // Baguette start - regenerate UUID instead of failing (Fireballs/CMI plugin bypass fix)
++            final java.util.UUID oldUUID = entity.getUUID();
++            final java.util.UUID newUUID = java.util.UUID.randomUUID();
++            entity.setUUID(newUUID);
++            final Entity secondAttempt = this.entityByUUID.putIfAbsent(newUUID, entity);
++            if (secondAttempt != null) {
++                this.entityById.remove((long)entity.getId(), entity);
++                LOGGER.warn("Entity uuid collision after regeneration: " + newUUID + ", mapped to " + secondAttempt + ", can't add " + entity);
++                return false;
++            }
++            LOGGER.debug("Baguette: Regenerated duplicate UUID {} -> {} for {} at {}", oldUUID, newUUID, entity.getType().getDescriptionId(), entity.blockPosition());
++            // Baguette end
+         }
+ 
+         ((ChunkSystemEntity)entity).moonrise$setSectionX(sectionX);
+diff --git a/net/minecraft/network/Connection.java b/net/minecraft/network/Connection.java
+index 271c507bc579db8f76f3a53cb98ccd54b0ed7d56..4f0786e426877c94c02cff5fc1206146bd1d8fc6 100644
+--- a/net/minecraft/network/Connection.java
++++ b/net/minecraft/network/Connection.java
+@@ -272,10 +272,23 @@ public class Connection extends SimpleChannelInboundHandler<Packet<?>> {
+                     synchronized (PACKET_LIMIT_LOCK) {
+                         if (this.allPacketCounts != null) {
+                             this.allPacketCounts.updateAndAdd(1, time);
+-                            if (this.allPacketCounts.getRate() >= io.papermc.paper.configuration.GlobalConfiguration.get().packetLimiter.allPackets.maxPacketRate()) {
++                            // Baguette start - packet limiter threshold config
++                            final double paperMaxRate = io.papermc.paper.configuration.GlobalConfiguration.get().packetLimiter.allPackets.maxPacketRate();
++                            final long overrideMaxRate = io.canvasmc.canvas.Config.INSTANCE.networking.allPacketsMaxPacketRateOverride;
++                            final double maxRateMultiplier = io.canvasmc.canvas.Config.INSTANCE.networking.allPacketsMaxPacketRateMultiplier;
++                            final double effectiveMaxRate;
++                            if (overrideMaxRate > 0L) {
++                                effectiveMaxRate = (double)overrideMaxRate;
++                            } else if (maxRateMultiplier > 0.0D && maxRateMultiplier != 1.0D) {
++                                effectiveMaxRate = paperMaxRate * maxRateMultiplier;
++                            } else {
++                                effectiveMaxRate = paperMaxRate;
++                            }
++                            if (this.allPacketCounts.getRate() >= effectiveMaxRate) {
+                                 this.killForPacketSpam();
+                                 return;
+                             }
++                            // Baguette end - packet limiter threshold config
+                         }
+ 
+                         for (Class<?> check = packet.getClass(); check != Object.class; check = check.getSuperclass()) {
+diff --git a/net/minecraft/network/FriendlyByteBuf.java b/net/minecraft/network/FriendlyByteBuf.java
+index fa4c2a1a7b1c97f7c662683778233c40aca81e4e..519a3161ae7a051f6a12b625e845a92d756ed8c4 100644
+--- a/net/minecraft/network/FriendlyByteBuf.java
++++ b/net/minecraft/network/FriendlyByteBuf.java
+@@ -118,6 +118,14 @@ public class FriendlyByteBuf extends ByteBuf {
+     public <T> void writeJsonWithCodec(Codec<T> codec, T value, int maxLength) {
+         // Paper end - Adventure; add max length parameter
+         DataResult<JsonElement> dataResult = codec.encodeStart(JsonOps.INSTANCE, value);
++        // Baguette start - no chat reports
++        if (io.canvasmc.canvas.Config.INSTANCE.enableNoChatReports && codec == net.minecraft.network.protocol.status.ServerStatus.CODEC) {
++            JsonElement element = dataResult.getOrThrow(exception -> new EncoderException("Failed to encode: " + exception + " " + value));
++            element.getAsJsonObject().addProperty("preventsChatReports", true);
++            this.writeUtf(GSON.toJson(element), maxLength);
++            return;
++        }
++        // Baguette end - no chat reports
+         this.writeUtf(GSON.toJson(dataResult.getOrThrow(exception -> new EncoderException("Failed to encode: " + exception + " " + value))), maxLength); // Paper - Adventure; add max length parameter
+     }
+ 
+diff --git a/net/minecraft/server/level/ServerLevel.java b/net/minecraft/server/level/ServerLevel.java
+index 44e107b1ee26903590cd4d389de1637165154489..ce663a6023746ab4dfa7761d834f46800122ac02 100644
+--- a/net/minecraft/server/level/ServerLevel.java
++++ b/net/minecraft/server/level/ServerLevel.java
+@@ -1718,6 +1718,24 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+             return true;
+         }
+         // Paper end - extra debug info
++        // Baguette start - exploit prevention
++        if (io.canvasmc.canvas.Config.INSTANCE.exploitPrevention.maxMinecartsPerChunk != -1 && entity instanceof net.minecraft.world.entity.vehicle.AbstractMinecart) {
++            ChunkPos chunkPos = entity.chunkPosition();
++            AABB aabb = new AABB(chunkPos.getMinBlockX(), -64, chunkPos.getMinBlockZ(), chunkPos.getMaxBlockX() + 1, 320, chunkPos.getMaxBlockZ() + 1);
++            int count = this.getEntities(net.minecraft.world.level.entity.EntityTypeTest.forClass(net.minecraft.world.entity.vehicle.AbstractMinecart.class), aabb, e -> true).size();
++            if (count >= io.canvasmc.canvas.Config.INSTANCE.exploitPrevention.maxMinecartsPerChunk) {
++                return false;
++            }
++        }
++        if (io.canvasmc.canvas.Config.INSTANCE.exploitPrevention.maxBoatsPerChunk != -1 && entity instanceof net.minecraft.world.entity.vehicle.Boat) {
++            ChunkPos chunkPos = entity.chunkPosition();
++            AABB aabb = new AABB(chunkPos.getMinBlockX(), -64, chunkPos.getMinBlockZ(), chunkPos.getMaxBlockX() + 1, 320, chunkPos.getMaxBlockZ() + 1);
++            int count = this.getEntities(net.minecraft.world.level.entity.EntityTypeTest.forClass(net.minecraft.world.entity.vehicle.Boat.class), aabb, e -> true).size();
++            if (count >= io.canvasmc.canvas.Config.INSTANCE.exploitPrevention.maxBoatsPerChunk) {
++                return false;
++            }
++        }
++        // Baguette end - exploit prevention
+         if (entity.spawnReason == null) entity.spawnReason = spawnReason; // Paper - Entity#getEntitySpawnReason
+         if (entity.isRemoved()) {
+             // LOGGER.warn("Tried to add entity {} but it was marked as removed already", EntityType.getKey(entity.getType())); // CraftBukkit - remove warning
+diff --git a/net/minecraft/util/FileUtil.java b/net/minecraft/util/FileUtil.java
+index 1eba57d1762c4b716409c6830e0a65b06586084d..dbbd2a8ac75a843ba1f2caf1df38c61304f31e14 100644
+--- a/net/minecraft/util/FileUtil.java
++++ b/net/minecraft/util/FileUtil.java
+@@ -117,7 +117,7 @@ public class FileUtil {
+                 default -> !containsAllowedCharactersOnly(path) ? DataResult.error(() -> "Invalid path '" + path + "'") : DataResult.success(List.of(path));
+             };
+         } else {
+-            List<String> list = new ArrayList<>();
++            List<String> list = new it.unimi.dsi.fastutil.objects.ObjectArrayList<>(); // Baguette - optimize collection
+             int i = 0;
+             boolean flag = false;
+ 
+diff --git a/net/minecraft/world/entity/Entity.java b/net/minecraft/world/entity/Entity.java
+index d07119d00cda8fcca13abf90153daaf87925eccf..f4c0c98abccbad13c167213c07e84c17d65ef0be 100644
+--- a/net/minecraft/world/entity/Entity.java
++++ b/net/minecraft/world/entity/Entity.java
+@@ -340,6 +340,15 @@ public abstract class Entity implements SyncedDataHolder, DebugValueSource, Name
+     private @Nullable BlockState inBlockState = null;
+     public static final int MAX_MOVEMENTS_HANDELED_PER_TICK = 100;
+     private final ArrayDeque<Entity.Movement> movementThisTick = new ArrayDeque<>(100);
++    // Baguette start - reduce allocations in collisions
++    private final it.unimi.dsi.fastutil.objects.ObjectArrayList<VoxelShape> baguette$potentialCollisionsVoxel = new it.unimi.dsi.fastutil.objects.ObjectArrayList<>();
++    private final it.unimi.dsi.fastutil.objects.ObjectArrayList<AABB> baguette$potentialCollisionsBB = new it.unimi.dsi.fastutil.objects.ObjectArrayList<>();
++    private final it.unimi.dsi.fastutil.objects.ObjectArrayList<AABB> baguette$entityAABBs = new it.unimi.dsi.fastutil.objects.ObjectArrayList<>();
++    private final it.unimi.dsi.fastutil.objects.ObjectArrayList<VoxelShape> baguette$stepVoxels = new it.unimi.dsi.fastutil.objects.ObjectArrayList<>();
++    private final it.unimi.dsi.fastutil.objects.ObjectArrayList<AABB> baguette$singleAABBList = new it.unimi.dsi.fastutil.objects.ObjectArrayList<>(1);
++    private final net.minecraft.world.level.chunk.ChunkAccess[] baguette$checkInsideBlocksCachedChunk = new net.minecraft.world.level.chunk.ChunkAccess[1];
++    private final long[] baguette$checkInsideBlocksLastChunkPos = new long[] { Long.MIN_VALUE };
++    // Baguette end - reduce allocations in collisions
+     private final List<Entity.Movement> finalMovementsThisTick = new ObjectArrayList<>();
+     private final LongSet visitedBlocks = new LongOpenHashSet();
+     private final InsideBlockEffectApplier.StepBasedCollector insideEffectCollector = new InsideBlockEffectApplier.StepBasedCollector();
+@@ -1138,6 +1147,17 @@ public abstract class Entity implements SyncedDataHolder, DebugValueSource, Name
+     }
+ 
+     public void move(MoverType type, Vec3 movement) {
++        // Baguette start - skip entity move if movement is zero
++        double dx = movement.x;
++        double dy = movement.y;
++        double dz = movement.z;
++        if (Math.abs(dx) < 1.0E-7D && Math.abs(dy) < 1.0E-7D && Math.abs(dz) < 1.0E-7D) {
++            if (!this.isPassenger() && !this.hasImpulse) {
++                return;
++            }
++        }
++        // Baguette end - skip entity move if movement is zero
++        
+         final Vec3 originalMovement = movement; // Paper - Expose pre-collision velocity
+         ca.spottedleaf.moonrise.common.util.TickThread.ensureTickThread("Cannot move an entity off-main"); // Folia - region threading
+         if (this.noPhysics) {
+diff --git a/net/minecraft/world/entity/Mob.java b/net/minecraft/world/entity/Mob.java
+index 34edafae825cb3b12ab7ec8fb8d621c1e5da1c7d..eaad79cb977d733102a1623708547e6e161c63d6 100644
+--- a/net/minecraft/world/entity/Mob.java
++++ b/net/minecraft/world/entity/Mob.java
+@@ -148,6 +148,7 @@ public abstract class Mob extends LivingEntity implements EquipmentUser, Leashab
+     private int homeRadius = -1;
+     public boolean aware = true; // CraftBukkit
+     public net.kyori.adventure.util.TriState despawnInPeacefulOverride = net.kyori.adventure.util.TriState.NOT_SET; // Paper - allow changing despawnInPeaceful
++    private final it.unimi.dsi.fastutil.objects.ObjectArrayList<net.minecraft.world.entity.item.ItemEntity> itemPickupCache = new it.unimi.dsi.fastutil.objects.ObjectArrayList<>(4); // Baguette - 0021: cached list for item pickup
+ 
+     protected Mob(EntityType<? extends Mob> type, Level level) {
+         super(type, level);
+@@ -547,8 +548,10 @@ public abstract class Mob extends LivingEntity implements EquipmentUser, Leashab
+             && serverLevel.getGameRules().get(GameRules.MOB_GRIEFING)) {
+             Vec3i pickupReach = this.getPickupReach();
+ 
+-            for (ItemEntity itemEntity : this.level()
+-                .getEntitiesOfClass(ItemEntity.class, this.getBoundingBox().inflate(pickupReach.getX(), pickupReach.getY(), pickupReach.getZ()))) {
++            // Baguette start - 0021: use cached list to avoid per-tick allocations
++            this.level().getEntitiesOfClassInto(ItemEntity.class, this.getBoundingBox().inflate(pickupReach.getX(), pickupReach.getY(), pickupReach.getZ()), this.itemPickupCache);
++            for (ItemEntity itemEntity : this.itemPickupCache) {
++            // Baguette end - 0021
+                 if (!itemEntity.isRemoved()
+                     && !itemEntity.getItem().isEmpty()
+                     && !itemEntity.hasPickUpDelay()
+diff --git a/net/minecraft/world/entity/item/ItemEntity.java b/net/minecraft/world/entity/item/ItemEntity.java
+index c7976a627ac5b4459c372e7c9e8aab9d7f8b4802..0451cff652c02e791ca5719786e43d6ed56bc4be 100644
+--- a/net/minecraft/world/entity/item/ItemEntity.java
++++ b/net/minecraft/world/entity/item/ItemEntity.java
+@@ -195,13 +195,20 @@ public class ItemEntity extends Entity implements TraceableEntity {
+                 }
+             }
+ 
+-            boolean flag = Mth.floor(this.xo) != Mth.floor(this.getX())
+-                || Mth.floor(this.yo) != Mth.floor(this.getY())
+-                || Mth.floor(this.zo) != Mth.floor(this.getZ());
+-            int i = flag ? 2 : 40;
+-            if (this.tickCount % i == 0 && !this.level().isClientSide() && this.isMergable()) {
+-                this.mergeWithNeighbours();
++            // Baguette start - optimize dropped items
++            if (!io.canvasmc.canvas.Config.INSTANCE.drops.disableMerging) {
++                boolean flag = Mth.floor(this.xo) != Mth.floor(this.getX())
++                    || Mth.floor(this.yo) != Mth.floor(this.getY())
++                    || Mth.floor(this.zo) != Mth.floor(this.getZ());
++                int i = flag ? 2 : 40;
++                if (io.canvasmc.canvas.Config.INSTANCE.drops.mergeIntervalTicks > 0) {
++                    i = io.canvasmc.canvas.Config.INSTANCE.drops.mergeIntervalTicks;
++                }
++                if (this.tickCount % i == 0 && !this.level().isClientSide() && this.isMergable()) {
++                    this.mergeWithNeighbours();
++                }
+             }
++            // Baguette end - optimize dropped items
+ 
+             if (this.age != -32768) {
+                 this.age++;
+diff --git a/net/minecraft/world/level/Level.java b/net/minecraft/world/level/Level.java
+index e4db8cfb2ce3d1bbc550f0386fe8bfa13c2bf1d3..a1be2d65d5b6884df60c9b70765c61c3740c758e 100644
+--- a/net/minecraft/world/level/Level.java
++++ b/net/minecraft/world/level/Level.java
+@@ -214,6 +214,19 @@ public abstract class Level implements LevelAccessor, AutoCloseable, ca.spottedl
+         return ret;
+     }
+ 
++    // Baguette start - 0021: Zero-allocation entity lookup (fill-into API)
++    public final <T extends Entity> void getEntitiesOfClassInto(final Class<T> entityClass, final AABB boundingBox,
++                                                                final List<? super T> into, final Predicate<? super T> predicate) {
++        into.clear();
++        ((ca.spottedleaf.moonrise.patches.chunk_system.level.ChunkSystemLevel)this).moonrise$getEntityLookup().getEntities(entityClass, null, boundingBox, into, predicate);
++    }
++
++    public final <T extends Entity> void getEntitiesOfClassInto(final Class<T> entityClass, final AABB boundingBox,
++                                                                final List<? super T> into) {
++        this.getEntitiesOfClassInto(entityClass, boundingBox, into, EntitySelector.NO_SPECTATORS);
++    }
++    // Baguette end - 0021
++
+     @Override
+     public final List<Entity> moonrise$getHardCollidingEntities(final Entity entity, final AABB box, final Predicate<? super Entity> predicate) {
+         final List<Entity> ret = new it.unimi.dsi.fastutil.objects.ObjectArrayList<>(); // Canvas - use optimized collection
+diff --git a/net/minecraft/world/level/ServerExplosion.java b/net/minecraft/world/level/ServerExplosion.java
+index a18ff4406c6f7c41fd6d4919a0420a110723d4aa..9ff6157183089ef3ea4bbe6e11b007f5d8984890 100644
+--- a/net/minecraft/world/level/ServerExplosion.java
++++ b/net/minecraft/world/level/ServerExplosion.java
+@@ -54,7 +54,7 @@ public class ServerExplosion implements Explosion {
+     private final float radius;
+     private final DamageSource damageSource;
+     private final ExplosionDamageCalculator damageCalculator;
+-    private final Map<Player, Vec3> hitPlayers = new HashMap<>();
++    private final Map<Player, Vec3> hitPlayers = new it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap<>(); // Baguette - optimize collection
+     // CraftBukkit - add field
+     public boolean wasCanceled = false;
+     public float yield;
+diff --git a/net/minecraft/world/level/pathfinder/PathFinder.java b/net/minecraft/world/level/pathfinder/PathFinder.java
+index 6a2104217aad4bc51914d5da2502180064ee6edc..83a100eb281e527e70309656800f3bc0d2201451 100644
+--- a/net/minecraft/world/level/pathfinder/PathFinder.java
++++ b/net/minecraft/world/level/pathfinder/PathFinder.java
+@@ -22,6 +22,10 @@ public class PathFinder {
+     private int maxVisitedNodes;
+     public final NodeEvaluator nodeEvaluator;
+     private final BinaryHeap openSet = new BinaryHeap();
++    // Baguette start - reduce allocations in pathfinding target handling
++    private final java.util.ArrayList<Map.Entry<Target, BlockPos>> baguette$targetEntries = new java.util.ArrayList<>();
++    private final java.util.ArrayList<Map.Entry<Target, BlockPos>> baguette$reachedTargetEntries = new java.util.ArrayList<>();
++    // Baguette end - reduce allocations in pathfinding target handling
+     private BooleanSupplier captureDebug = () -> false;
+ 
+     public PathFinder(NodeEvaluator nodeEvaluator, int maxVisitedNodes) {
+@@ -48,13 +52,18 @@ public class PathFinder {
+             return null;
+         } else {
+             // Paper start - Perf: remove streams and optimize collection
+-            List<Map.Entry<Target, BlockPos>> map = Lists.newArrayList();
++            // Baguette start - reduce allocations in pathfinding target handling
++            List<Map.Entry<Target, BlockPos>> map = this.baguette$targetEntries;
++            map.clear();
++            this.baguette$targetEntries.ensureCapacity(targets.size());
++            // Baguette end - reduce allocations in pathfinding target handling
+             for (BlockPos pos : targets) {
+                 map.add(new java.util.AbstractMap.SimpleEntry<>(this.nodeEvaluator.getTarget(pos.getX(), pos.getY(), pos.getZ()), pos));
+             }
+             // Paper end - Perf: remove streams and optimize collection
+             Path path = this.findPath(start, map, maxRange, reachRange, maxVisitedNodesMultiplier);
+             this.nodeEvaluator.done();
++            map.clear(); // Baguette - reduce allocations in pathfinding target handling
+             return path;
+         }
+     }
